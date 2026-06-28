@@ -1,6 +1,3 @@
-"""
-POLYMARKET ULTIMATE BOT v5.1 — INTEGRATED WATCHLIST & DIGEST
-"""
 import asyncio
 import json
 import logging
@@ -15,9 +12,6 @@ import httpx
 import websockets
 from aiohttp import web
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("polybot")
-
 # ── Config & State ─────────────────────────────────────────────────────────────
 TOKEN         = os.getenv("TELEGRAM_TOKEN", "")
 OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID", "")
@@ -28,7 +22,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
 PORT = int(os.getenv("PORT", "10000"))
 STATE_FILE = Path("/tmp/polybot_state.json")
 
-# New persistent state containers
+# State Containers
 subscribers = {}
 user_thresholds = {}
 user_sensitivity = {}
@@ -36,7 +30,6 @@ wallet_pending = {}
 user_watchlists = defaultdict(set) 
 daily_stats = defaultdict(lambda: {"max_trade": 0.0})
 
-# Existing Market Data Structures
 market_trades = defaultdict(lambda: deque(maxlen=200))
 market_prices = defaultdict(dict)
 market_volumes = defaultdict(lambda: deque(maxlen=100))
@@ -52,6 +45,7 @@ sentiment_history = defaultdict(lambda: deque(maxlen=60))
 last_alert = defaultdict(float)
 asset_slug = {}
 subscribed_assets = set()
+_health_runner = None
 
 # ── Persistence & Helpers ──────────────────────────────────────────────────────
 def save_state():
@@ -78,10 +72,18 @@ def load_state() -> bool:
     return False
 
 def slug_for(asset_id: str) -> str: return asset_slug.get(asset_id, asset_id[:20])
+def cooldown_ok(asset_id, alert_type, seconds=60):
+    key = (asset_id, alert_type)
+    if time.monotonic() - last_alert[key] > seconds:
+        last_alert[key] = time.monotonic()
+        return True
+    return False
+def safe_float(val, fallback=0.0):
+    try: return float(val)
+    except: return fallback
 
-# ── New Features Logic ────────────────────────────────────────────────────────
+# ── Feature: Daily Whale Digest ───────────────────────────────────────────────
 async def daily_whale_digest():
-    """Background task running every 24h to broadcast whale stats."""
     while True:
         await asyncio.sleep(86400)
         report = "*Daily Whale Digest*\n\n"
@@ -91,33 +93,28 @@ async def daily_whale_digest():
                 report += f"🐳 {slug}: Top trade `${stats['max_trade']:,.0f}`\n"
                 found = True
         if found:
-            for cid in list(subscribers.keys()):
-                await send(cid, report)
+            for cid in list(subscribers.keys()): await send(cid, report)
         daily_stats.clear()
 
+# ── Broadcast & Commands ──────────────────────────────────────────────────────
 async def broadcast(alert_type: str, text: str, asset_id: str = ""):
     slug = slug_for(asset_id).lower()
     for cid, types in list(subscribers.items()):
-        # Watchlist filtering
         if user_watchlists[cid] and slug not in user_watchlists[cid]: continue
-        if alert_type in types:
-            await send(cid, text)
-            
-    # Chart logic with filter
+        if alert_type in types: await send(cid, text)
     if alert_type in ("flash_crash", "momentum") and asset_id:
         for cid in [c for c, t in list(subscribers.items()) if "chart" in t]:
             if user_watchlists[cid] and slug not in user_watchlists[cid]: continue
             prices = [p for _, p in list(trade_price_history[asset_id])[-40:]]
             if len(prices) >= 2: await send_chart(cid, prices, f"Chart — {slug_for(asset_id)}")
 
-# ── (Insert original functions here: fetch_active_asset_ids, poll_telegram, process_*, etc) ──
-# Note: Ensure cmd_watch and cmd_unwatch are added to your poll_telegram command list.
+# (Paste your original fetch_active_asset_ids, run_health_server, self_ping_loop, send, send_chart, poll_telegram, etc. here)
 
 async def main():
     load_state()
     await run_health_server()
-    asyncio.create_task(daily_whale_digest()) # TASK INITIATED
-    # ... rest of your original main logic ...
+    asyncio.create_task(daily_whale_digest())
+    # ... include your existing main initialization logic here ...
     await asyncio.gather(
         supervised("telegram_poll", poll_telegram),
         supervised("polymarket_ws", polymarket_ws),
