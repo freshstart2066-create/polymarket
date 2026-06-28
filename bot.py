@@ -32,11 +32,14 @@ PORT            = int(os.getenv("PORT", "10000"))
 REDIS_URL       = os.getenv("REDIS_URL", "")
 SELF_URL        = os.getenv("RENDER_EXTERNAL_URL", "")
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-ANTHROPIC_API     = "https://api.anthropic.com/v1/messages"
-AI_MODEL          = "claude-sonnet-4-6"
-AI_MAX_TOKENS     = 1024
-AI_MAX_HISTORY    = 20   # messages kept per user for conversation memory
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL    = "gemini-2.0-flash"   # free tier, fast, generous limits
+GEMINI_API      = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent"
+)
+AI_MAX_TOKENS   = 1024
+AI_MAX_HISTORY  = 20   # messages kept per user for conversation memory
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -808,13 +811,14 @@ def _build_market_context(chat_id: str) -> str:
 
 
 async def cmd_ask(chat_id: str | int, question: str):
-    """Handle /ask <question> or any plain-text message routed here."""
+    """Handle /ask <question> or any plain-text message — powered by Gemini."""
     cid = str(chat_id)
 
-    if not ANTHROPIC_API_KEY:
+    if not GEMINI_API_KEY:
         await send(chat_id,
             "⚠️ AI assistant not configured.\n"
-            "Set the `ANTHROPIC_API_KEY` environment variable on Render to enable it.")
+            "Set the `GEMINI_API_KEY` environment variable on Render to enable it.\n"
+            "Get a free key at: aistudio.google.com")
         return
 
     if not question.strip():
@@ -824,56 +828,78 @@ async def cmd_ask(chat_id: str | int, question: str):
             "Or just send a message without a command and I'll reply.")
         return
 
-    # Typing indicator feel — acknowledge quickly
     await send(chat_id, "🤖 _Thinking…_")
 
-    # Build conversation history (keep last N turns for memory)
-    history = list(ai_conversations[cid])
-    history.append({"role": "user", "content": question})
-
-    # Trim to max history (pairs of user/assistant)
-    if len(history) > AI_MAX_HISTORY:
-        history = history[-AI_MAX_HISTORY:]
-
+    cid_history = list(ai_conversations[cid])
     system_prompt = _build_market_context(cid)
+
+    # Gemini uses "contents" array with "role" + "parts"
+    # System prompt is prepended as the first user turn (Gemini REST doesn't
+    # have a dedicated system field in the basic generateContent endpoint)
+    contents = []
+
+    # Inject system context as a priming exchange so it doesn't count as
+    # the live user question but still guides every reply
+    contents.append({
+        "role": "user",
+        "parts": [{"text": system_prompt}]
+    })
+    contents.append({
+        "role": "model",
+        "parts": [{"text": "Understood. I'm ready to help."}]
+    })
+
+    # Replay conversation history
+    for msg in cid_history[-AI_MAX_HISTORY:]:
+        gemini_role = "model" if msg["role"] == "assistant" else "user"
+        contents.append({
+            "role": gemini_role,
+            "parts": [{"text": msg["content"]}]
+        })
+
+    # Append the new question
+    contents.append({
+        "role": "user",
+        "parts": [{"text": question}]
+    })
 
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                ANTHROPIC_API,
-                headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
+                GEMINI_API,
+                params={"key": GEMINI_API_KEY},
+                headers={"content-type": "application/json"},
                 json={
-                    "model":      AI_MODEL,
-                    "max_tokens": AI_MAX_TOKENS,
-                    "system":     system_prompt,
-                    "messages":   history,
+                    "contents": contents,
+                    "generationConfig": {
+                        "maxOutputTokens": AI_MAX_TOKENS,
+                        "temperature": 0.7,
+                    },
                 },
                 timeout=30,
             )
             data = resp.json()
 
         if resp.status_code != 200:
-            log.warning(f"AI API error {resp.status_code}: {data}")
-            await send(chat_id, f"⚠️ AI error: {data.get('error', {}).get('message', 'unknown')}")
+            err = data.get("error", {}).get("message", "unknown error")
+            log.warning(f"Gemini API error {resp.status_code}: {err}")
+            await send(chat_id, f"⚠️ AI error: {err}")
             return
 
-        reply = "".join(
-            block.get("text", "")
-            for block in data.get("content", [])
-            if block.get("type") == "text"
-        ).strip()
+        # Extract text from Gemini response structure
+        try:
+            reply = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except (KeyError, IndexError):
+            reply = ""
 
         if not reply:
             await send(chat_id, "⚠️ AI returned an empty response. Please try again.")
             return
 
-        # Store assistant reply in history
-        history.append({"role": "assistant", "content": reply})
-        ai_conversations[cid] = deque(history, maxlen=AI_MAX_HISTORY)
+        # Save to conversation history using standard role names
+        cid_history.append({"role": "user",      "content": question})
+        cid_history.append({"role": "assistant",  "content": reply})
+        ai_conversations[cid] = deque(cid_history, maxlen=AI_MAX_HISTORY)
 
         await send(chat_id, f"🤖 {reply}")
 
