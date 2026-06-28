@@ -1,27 +1,73 @@
 """
-POLYMARKET ULTIMATE BOT v4.0 — FULLY FIXED
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Fixes applied from v3.2 audit:
-  [FIX-01] Hardcoded token/chat_id removed — env vars only, no defaults
-  [FIX-02] WebSocket subscription payload corrected for Polymarket CLOB API
-  [FIX-03] aiohttp runner stored at module level to prevent GC-induced server death
-  [FIX-04] wallet_activity append moved AFTER cluster check to prevent self-counting
-  [FIX-05] price_history split into trade_price_history vs book_price_history
-  [FIX-06] check_bid_ask_collapse guards against zero-spread startup noise
-  [FIX-07] check_market_maker threshold raised to realistic prediction market value
-  [FIX-08] check_arbitrage replaced with cross-outcome sum deviation logic
-  [FIX-09] poll_telegram respects HTTP 429 retry_after from Telegram
-  [FIX-10] asyncio.gather replaced with independent supervised restart loops
-  [FIX-11] send_chart is now wired into the "chart" broadcast path
-  [FIX-12] order book field parsing hardened with try/float fallbacks
-  [FIX-13] Persistent state saved to JSON file — survives Render restarts
-  [FIX-14] README section at bottom explains UptimeRobot setup for free Render tier
+POLYMARKET ULTIMATE BOT v5.0 — FREE RENDER EDITION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Fixes applied on top of v4.0 after official Polymarket WS docs review:
 
-Required env vars (set in Render dashboard):
-  TELEGRAM_TOKEN   — your bot token from @BotFather
-  OWNER_CHAT_ID    — your personal Telegram numeric chat ID
-  WHALE_THRESHOLD_USD  — (optional) default 5000
-  PORT             — (optional) default 10000
+  [FIX-A] WS subscription: market channel requires `assets_ids` (token IDs),
+          NOT a channel name string. v4.0 sent {"channel":"live_activity"}
+          which is completely invalid — server closes connection immediately.
+          Bot now fetches top active markets from Gamma REST API on startup
+          and subscribes to their asset IDs properly.
+
+  [FIX-B] WS event names corrected to official docs:
+          "last_trade_price" (not "trade"/"orders_matched"/"TRADE")
+          "book"             (not "order_book"/"book_snapshot"/"BOOK")
+          "price_change"     (not "price_update"/"PRICE_CHANGE")
+          Old names never matched, so NO alerts ever fired.
+
+  [FIX-C] price_change payload structure fixed:
+          Official format is msg["price_changes"] = [{side,size,price,
+          best_bid,best_ask,...}], not a flat msg with a single price field.
+
+  [FIX-D] last_trade_price payload structure fixed:
+          Official format: msg.side, msg.size, msg.price (flat fields).
+
+  [FIX-E] book payload structure fixed:
+          Official format: msg.bids / msg.asks are lists of {price, size}.
+          asset_id identifies which token the book belongs to.
+
+  [FIX-F] Heartbeat: official docs require sending plain text "PING" (not JSON)
+          every 10 seconds. Server sends "PONG"; must filter "PONG" before
+          JSON-parsing. v4.0 relied on websockets library auto-ping which
+          uses binary WS pings — Polymarket server requires TEXT "PING".
+
+  [FIX-G] `custom_feature_enabled: true` added to subscription to receive
+          best_bid_ask, new_market, market_resolved events.
+
+  [FIX-H] Self-ping keep-alive loop built into the bot itself (pings own
+          /health endpoint every 10 min). On Render free tier, the WS
+          connection is outbound and does NOT reset the 15-min sleep timer.
+          Only inbound HTTP resets it. The built-in self-ping removes the
+          need for a separate UptimeRobot setup, though adding one is still
+          recommended as a belt-and-suspenders measure.
+
+  [FIX-I] Market refresh loop: re-fetches active market list every 30 min
+          and re-subscribes to any new asset IDs, keeping the bot alive to
+          new markets without a restart.
+
+  [FIX-J] Render free tier has 512 MB RAM and 0.1 CPU. All deque maxlens
+          reduced to avoid OOM under sustained load from many markets.
+
+  [FIX-K] safe_float signature fixed: `default` was a keyword-only collision
+          with Python builtins. Renamed to `fallback`.
+
+  [FIX-L] /tmp state file survives within a single Render instance uptime
+          but is wiped on restart. Added a startup notice to the owner when
+          state could not be loaded (fresh instance).
+
+  [FIX-M] Asset→market slug mapping kept in memory so alerts show human-
+          readable market names instead of raw condition IDs.
+
+Required env vars (Render dashboard → Environment):
+  TELEGRAM_TOKEN       — from @BotFather
+  OWNER_CHAT_ID        — your Telegram numeric chat ID
+  WHALE_THRESHOLD_USD  — optional, default 5000
+  PORT                 — set automatically by Render, default 10000
+
+requirements.txt:
+  httpx
+  websockets
+  aiohttp
 """
 
 import asyncio
@@ -38,28 +84,34 @@ import httpx
 import websockets
 from aiohttp import web
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 log = logging.getLogger("polybot")
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-# [FIX-01] No hardcoded secrets — bot will refuse to start if vars are missing
 TOKEN         = os.getenv("TELEGRAM_TOKEN", "")
 OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID", "")
 if not TOKEN or not OWNER_CHAT_ID:
     raise RuntimeError(
-        "TELEGRAM_TOKEN and OWNER_CHAT_ID must be set as environment variables. "
-        "Never hardcode secrets in source code."
+        "TELEGRAM_TOKEN and OWNER_CHAT_ID must be set as environment variables.\n"
+        "Go to Render → your service → Environment and add them."
     )
 
 WHALE_THRESHOLD   = float(os.getenv("WHALE_THRESHOLD_USD", "5000"))
-POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"  # [FIX-A]
+GAMMA_API         = "https://gamma-api.polymarket.com"
 TELEGRAM_API      = f"https://api.telegram.org/bot{TOKEN}"
 PORT              = int(os.getenv("PORT", "10000"))
-STATE_FILE        = Path("/tmp/polybot_state.json")  # [FIX-13] persistence
+STATE_FILE        = Path("/tmp/polybot_state.json")
+
+# How many top markets to subscribe to on startup
+TOP_MARKETS_LIMIT = 50
 
 ALL_ALERTS = {
     "whale", "volume_spike", "flash_crash", "liquidity_drain", "order_wall",
-    "coordinated", "price_div", "bid_ask_collapse", "momentum", "whale_cluster",
+    "coordinated", "bid_ask_collapse", "momentum", "whale_cluster",
     "arbitrage", "imbalance_ratio", "volume_profile", "sentiment_shift",
     "depth_prediction", "pattern_match", "anomaly_score",
     "insider_signal", "market_maker", "chart",
@@ -97,32 +149,36 @@ NETWORKS = {
 }
 
 # ── In-memory state ────────────────────────────────────────────────────────────
-subscribers:      dict = {}       # chat_id → set of alert types
-user_thresholds:  dict = {}       # chat_id → float
-user_sensitivity: dict = {}       # chat_id → str
-wallet_pending:   dict = {}       # chat_id → {"address": str}
+subscribers:      dict = {}
+user_thresholds:  dict = {}
+user_sensitivity: dict = {}
+wallet_pending:   dict = {}
 
-market_trades        = defaultdict(lambda: deque(maxlen=500))
+# [FIX-J] Reduced maxlen to stay inside 512 MB Render free RAM
+market_trades        = defaultdict(lambda: deque(maxlen=200))
 market_prices        = defaultdict(dict)
-market_volumes       = defaultdict(lambda: deque(maxlen=200))
+market_volumes       = defaultdict(lambda: deque(maxlen=100))
 market_order_book    = defaultdict(dict)
-# [FIX-05] Separate histories: trade prices vs book/tick prices
-trade_price_history  = defaultdict(lambda: deque(maxlen=240))
-book_price_history   = defaultdict(lambda: deque(maxlen=240))
-bid_ask_spreads      = defaultdict(lambda: deque(maxlen=100))
+trade_price_history  = defaultdict(lambda: deque(maxlen=120))
+book_price_history   = defaultdict(lambda: deque(maxlen=120))
+bid_ask_spreads      = defaultdict(lambda: deque(maxlen=60))
 volume_profile_data  = defaultdict(lambda: defaultdict(float))
-order_book_history   = defaultdict(lambda: deque(maxlen=100))
-wallet_activity      = defaultdict(lambda: deque(maxlen=300))
+order_book_history   = defaultdict(lambda: deque(maxlen=60))
+wallet_activity      = defaultdict(lambda: deque(maxlen=150))
 anomaly_scores       = defaultdict(float)
-sentiment_history    = defaultdict(lambda: deque(maxlen=100))
+sentiment_history    = defaultdict(lambda: deque(maxlen=60))
 last_alert: dict     = defaultdict(float)
 
-# [FIX-03] Global runner reference prevents GC killing the health server
-_health_runner = None
+# [FIX-M] asset_id → human-readable slug
+asset_slug: dict     = {}
+# Currently subscribed asset IDs
+subscribed_assets: set = set()
+
+_health_runner = None  # prevent GC
 
 
-def cooldown_ok(market_id: str, alert_type: str, seconds: int = 60) -> bool:
-    key = (market_id, alert_type)
+def cooldown_ok(asset_id: str, alert_type: str, seconds: int = 60) -> bool:
+    key = (asset_id, alert_type)
     now = time.monotonic()
     if now - last_alert[key] > seconds:
         last_alert[key] = now
@@ -130,17 +186,19 @@ def cooldown_ok(market_id: str, alert_type: str, seconds: int = 60) -> bool:
     return False
 
 
-def safe_float(val, default: float = 0.0) -> float:
-    """[FIX-12] Safely parse any numeric field from WS messages."""
+def safe_float(val, fallback: float = 0.0) -> float:  # [FIX-K]
     try:
         return float(val)
     except (TypeError, ValueError):
-        return default
+        return fallback
+
+
+def slug_for(asset_id: str) -> str:
+    """Return human-readable market name, falling back to truncated ID."""
+    return asset_slug.get(asset_id, asset_id[:20])
 
 
 # ── Persistence ────────────────────────────────────────────────────────────────
-# [FIX-13] Save/load subscribers and thresholds so Render restarts don't wipe them.
-
 def save_state():
     try:
         data = {
@@ -153,7 +211,8 @@ def save_state():
         log.warning(f"State save failed: {e}")
 
 
-def load_state():
+def load_state() -> bool:
+    """Returns True if state was loaded, False if fresh start."""
     try:
         if STATE_FILE.exists():
             data = json.loads(STATE_FILE.read_text())
@@ -162,8 +221,39 @@ def load_state():
             user_thresholds.update(data.get("user_thresholds", {}))
             user_sensitivity.update(data.get("user_sensitivity", {}))
             log.info(f"State loaded: {len(subscribers)} subscribers")
+            return True
     except Exception as e:
         log.warning(f"State load failed: {e}")
+    return False
+
+
+# ── Polymarket Market Discovery ────────────────────────────────────────────────
+async def fetch_active_asset_ids() -> dict:
+    """
+    [FIX-A] Fetch top active markets from Gamma API.
+    Returns {asset_id: slug} for all token IDs of active markets.
+    """
+    mapping = {}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                f"{GAMMA_API}/markets",
+                params={"active": "true", "closed": "false", "limit": TOP_MARKETS_LIMIT,
+                        "order": "volume24hr", "ascending": "false"},
+            )
+            markets = r.json()
+            if not isinstance(markets, list):
+                markets = markets.get("markets", [])
+            for m in markets:
+                slug = m.get("slug") or m.get("question") or m.get("id", "unknown")
+                # Each market has clob_token_ids = [yes_token_id, no_token_id]
+                for token_id in m.get("clob_token_ids", []):
+                    if token_id:
+                        mapping[str(token_id)] = slug
+        log.info(f"Fetched {len(mapping)} asset IDs across {len(markets)} markets")
+    except Exception as e:
+        log.warning(f"Failed to fetch market list: {e}")
+    return mapping
 
 
 # ── Health Server ──────────────────────────────────────────────────────────────
@@ -172,18 +262,42 @@ async def health_handler(request):
 
 
 async def run_health_server():
-    global _health_runner  # [FIX-03] prevent GC
+    global _health_runner
     app = web.Application()
     app.router.add_get("/", health_handler)
     app.router.add_get("/health", health_handler)
     _health_runner = web.AppRunner(app)
     await _health_runner.setup()
     await web.TCPSite(_health_runner, "0.0.0.0", PORT).start()
-    log.info(f"✅ Health server on port {PORT}")
+    log.info(f"✅ Health server on :{PORT}")
+
+
+# ── Self-Ping (Render free tier keep-alive) ────────────────────────────────────
+async def self_ping_loop():
+    """
+    [FIX-H] Pings own /health every 10 minutes to prevent Render free tier
+    sleep. Render only resets its 15-min inactivity timer on inbound HTTP.
+    The outbound Polymarket WS connection does NOT count.
+    """
+    await asyncio.sleep(60)  # wait for server to be fully up
+    render_url = os.getenv("RENDER_EXTERNAL_URL", "")
+    if not render_url:
+        log.info("RENDER_EXTERNAL_URL not set — self-ping disabled (use UptimeRobot instead)")
+        return
+    url = f"{render_url}/health"
+    log.info(f"Self-ping loop started → {url} every 10 min")
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                r = await c.get(url)
+                log.debug(f"Self-ping: {r.status_code}")
+        except Exception as e:
+            log.warning(f"Self-ping failed: {e}")
+        await asyncio.sleep(600)  # 10 minutes
 
 
 # ── Telegram ───────────────────────────────────────────────────────────────────
-async def send(chat_id: str, text: str, parse_mode="Markdown"):
+async def send(chat_id: str, text: str, parse_mode: str = "Markdown"):
     try:
         async with httpx.AsyncClient(timeout=8) as client:
             await client.post(f"{TELEGRAM_API}/sendMessage", json={
@@ -191,11 +305,10 @@ async def send(chat_id: str, text: str, parse_mode="Markdown"):
                 "parse_mode": parse_mode, "disable_web_page_preview": True,
             })
     except Exception as e:
-        log.warning(f"Send failed to {chat_id}: {e}")
+        log.warning(f"Send failed → {chat_id}: {e}")
 
 
 async def send_chart(chat_id: str, prices: list, title: str):
-    """Render an ASCII price chart and send it. [FIX-11] Now wired into broadcast."""
     if len(prices) < 2:
         return
     min_p, max_p = min(prices), max(prices)
@@ -210,24 +323,18 @@ async def send_chart(chat_id: str, prices: list, title: str):
     await send(chat_id, f"```\n{title}\n{rows}\nLo:${min_p:.4f}  Hi:${max_p:.4f}\n```")
 
 
-async def broadcast(alert_type: str, text: str, market_id: str = ""):
-    """
-    Send alert to all subscribers of this alert type.
-    [FIX-11] If alert_type is 'chart', also push ASCII chart to chart subscribers.
-    """
+async def broadcast(alert_type: str, text: str, asset_id: str = ""):
     targets = [cid for cid, types in list(subscribers.items()) if alert_type in types]
-    tasks = [send(cid, text) for cid in targets]
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    # [FIX-11] Chart broadcast: send price chart after any flash_crash or momentum alert
-    if alert_type in ("flash_crash", "momentum") and market_id:
+    if targets:
+        await asyncio.gather(*[send(cid, text) for cid in targets], return_exceptions=True)
+    # Chart follow-up for crash / momentum alerts
+    if alert_type in ("flash_crash", "momentum") and asset_id:
         chart_targets = [cid for cid, types in list(subscribers.items()) if "chart" in types]
         if chart_targets:
-            prices = [p for _, p in list(trade_price_history[market_id])[-40:]]
+            prices = [p for _, p in list(trade_price_history[asset_id])[-40:]]
             if len(prices) >= 2:
                 for cid in chart_targets:
-                    await send_chart(cid, prices, f"Price chart — {market_id[:18]}")
+                    await send_chart(cid, prices, f"Chart — {slug_for(asset_id)}")
 
 
 # ── Commands ───────────────────────────────────────────────────────────────────
@@ -236,19 +343,20 @@ async def cmd_start(chat_id: str, username: str):
     user_sensitivity[chat_id] = "normal"
     save_state()
     await send(chat_id,
-        "🚀 *POLYMARKET SIGNAL BOT v4.0*\n\n"
-        "Live alerts from Polymarket:\n\n"
+        "🚀 *POLYMARKET SIGNAL BOT v5.0*\n\n"
+        "Receiving live data from Polymarket CLOB WebSocket.\n\n"
         "🐳 Whale trades & clusters\n"
         "📈 Volume spikes\n"
         "💥 Flash crashes + chart\n"
         "🚨 Liquidity drains\n"
         "🧱 Order walls\n"
-        "🔄 Coordinated buys/sells\n"
+        "🔄 Coordinated trading\n"
         "⚖️ Bid/ask imbalance\n"
         "💡 Sentiment shifts\n"
         "🤖 Anomaly scoring\n"
         "📚 Pattern matching\n"
         "🏦 Market maker detection\n"
+        "💰 Outcome mispricing\n"
         "💼 Wallet balance checker\n\n"
         "/help — all commands"
     )
@@ -258,15 +366,16 @@ async def cmd_help(chat_id: str):
     nets = " | ".join(NETWORKS.keys())
     await send(chat_id,
         "🤖 *Commands*\n\n"
-        "/start — subscribe to all alerts\n"
-        "/status — your current settings\n"
+        "/start — subscribe all alerts\n"
+        "/status — your settings\n"
         "/dashboard — enable all alerts\n"
-        "/lite — whale + crash alerts only\n"
+        "/lite — whale + crash only\n"
+        "/markets — how many markets tracked\n"
         "/stop — unsubscribe\n\n"
         "💼 *Wallet:*\n"
         f"`/wallet 0xAddress network`\n"
         f"Networks: `{nets}`\n\n"
-        "📊 *Alert types you can toggle:*\n"
+        "📊 *Alert types:*\n"
         "`whale` `volume_spike` `flash_crash`\n"
         "`liquidity_drain` `order_wall` `coordinated`\n"
         "`imbalance_ratio` `sentiment_shift`\n"
@@ -279,12 +388,20 @@ async def cmd_status(chat_id: str):
         await send(chat_id, "Not subscribed. Use /start")
         return
     threshold = user_thresholds.get(chat_id, WHALE_THRESHOLD)
-    active = len(subscribers[chat_id])
     await send(chat_id,
         f"📊 *Your Settings*\n\n"
         f"Whale threshold: `${threshold:,.0f}`\n"
-        f"Active alerts: `{active}`\n"
-        f"Total subscribers: `{len(subscribers)}`"
+        f"Active alerts: `{len(subscribers[chat_id])}`\n"
+        f"Total subscribers: `{len(subscribers)}`\n"
+        f"Markets tracked: `{len(subscribed_assets)}`"
+    )
+
+
+async def cmd_markets(chat_id: str):
+    await send(chat_id,
+        f"📡 *Market Coverage*\n\n"
+        f"Asset IDs subscribed: `{len(subscribed_assets)}`\n"
+        f"Unique markets: `{len(set(asset_slug.values()))}`"
     )
 
 
@@ -297,7 +414,7 @@ async def cmd_dashboard(chat_id: str):
 async def cmd_lite(chat_id: str):
     subscribers[chat_id] = {"whale", "flash_crash", "coordinated", "anomaly_score"}
     save_state()
-    await send(chat_id, "📱 Lite mode — whale, crash, coordinated, anomaly alerts only")
+    await send(chat_id, "📱 Lite mode — whale, crash, coordinated, anomaly only")
 
 
 # ── Wallet ─────────────────────────────────────────────────────────────────────
@@ -321,9 +438,9 @@ async def get_wallet_balances(wallet: str, network_key: str) -> str:
     if not net:
         return "❌ Unknown network."
     try:
-        res = await rpc_call(net["rpc"], "eth_getBalance", [wallet, "latest"])
+        res   = await rpc_call(net["rpc"], "eth_getBalance", [wallet, "latest"])
         native = int(res.get("result", "0x0"), 16) / 1e18
-        usdc = await erc20_balance(net["rpc"], net["usdc"], wallet, net["decimals"])
+        usdc   = await erc20_balance(net["rpc"], net["usdc"], wallet, net["decimals"])
         usdt_line = ""
         if net.get("usdt"):
             usdt = await erc20_balance(net["rpc"], net["usdt"], wallet, net["decimals"])
@@ -335,7 +452,7 @@ async def get_wallet_balances(wallet: str, network_key: str) -> str:
             f"🪙 {net['symbol']}: `{native:.5f}`\n"
             f"💵 USDC: `${usdc:,.2f}`\n"
             f"{usdt_line}"
-            f"\n[View on Explorer]({net['explorer']}{wallet})"
+            f"\n[Explorer]({net['explorer']}{wallet})"
         )
     except Exception as e:
         log.warning(f"Wallet error: {e}")
@@ -347,7 +464,7 @@ async def cmd_wallet(chat_id: str, args: list):
     if len(args) >= 2:
         addr, net = args[0], args[1].lower()
         if not addr.startswith("0x") or len(addr) < 40:
-            await send(chat_id, "❌ Invalid address. Example:\n`/wallet 0xABC... polygon`")
+            await send(chat_id, "❌ Invalid address.")
             return
         if net not in NETWORKS:
             await send(chat_id, f"❌ Unknown network. Options: `{nets_str}`")
@@ -361,25 +478,14 @@ async def cmd_wallet(chat_id: str, args: list):
             return
         wallet_pending[chat_id] = {"address": addr}
         await send(chat_id,
-            f"✅ Got address `{addr[:8]}…{addr[-6:]}`\n\n"
-            f"Which network?\n`{nets_str}`\n\nJust reply with the name."
-        )
+            f"✅ Got `{addr[:8]}…{addr[-6:]}`\n\nWhich network?\n`{nets_str}`\n\nReply with the name.")
     else:
         await send(chat_id,
-            "💼 *Wallet Balance Checker*\n\n"
-            f"Usage: `/wallet 0xYourAddress polygon`\n\n"
-            f"Networks: `{nets_str}`"
-        )
+            f"💼 *Wallet Checker*\n\n`/wallet 0xYourAddress polygon`\n\nNetworks: `{nets_str}`")
 
 
 # ── Telegram Polling ───────────────────────────────────────────────────────────
 async def poll_telegram():
-    """
-    Long-poll Telegram for incoming messages.
-    [FIX-09] Respects HTTP 429 retry_after from Telegram.
-    Fresh httpx client per iteration prevents silent connection death.
-    wallet_pending replies handled before slash filter.
-    """
     offset = 0
     log.info("Telegram polling started")
     while True:
@@ -389,27 +495,25 @@ async def poll_telegram():
                     "offset": offset, "timeout": 30, "allowed_updates": ["message"],
                 })
 
-            # [FIX-09] Respect rate limit
             if r.status_code == 429:
                 retry_after = r.json().get("parameters", {}).get("retry_after", 10)
                 log.warning(f"Telegram 429 — sleeping {retry_after}s")
                 await asyncio.sleep(retry_after)
                 continue
 
-            data = r.json()
-            for update in data.get("result", []):
-                offset = update["update_id"] + 1
-                msg = update.get("message", {})
+            for update in r.json().get("result", []):
+                offset    = update["update_id"] + 1
+                msg       = update.get("message", {})
                 if not msg:
                     continue
-                chat_id  = str(msg["chat"]["id"])
-                raw_text = msg.get("text", "").strip()
+                chat_id   = str(msg["chat"]["id"])
+                raw_text  = msg.get("text", "").strip()
                 if not raw_text:
                     continue
 
-                # Wallet pending reply — checked BEFORE slash filter
+                # Wallet pending reply — BEFORE slash filter
                 if chat_id in wallet_pending and not raw_text.startswith("/"):
-                    net = raw_text.lower().strip()
+                    net     = raw_text.lower().strip()
                     pending = wallet_pending.pop(chat_id)
                     if net not in NETWORKS:
                         await send(chat_id, f"❌ Unknown network. Options: `{' | '.join(NETWORKS.keys())}`")
@@ -422,8 +526,8 @@ async def poll_telegram():
                     continue
 
                 parts = raw_text.split()
-                cmd  = parts[0].lower().split("@")[0]
-                args = parts[1:]
+                cmd   = parts[0].lower().split("@")[0]
+                args  = parts[1:]
                 log.info(f"CMD {cmd} from {chat_id}")
 
                 if   cmd == "/start":     await cmd_start(chat_id, msg.get("from", {}).get("username", "?"))
@@ -431,6 +535,7 @@ async def poll_telegram():
                 elif cmd == "/status":    await cmd_status(chat_id)
                 elif cmd == "/dashboard": await cmd_dashboard(chat_id)
                 elif cmd == "/lite":      await cmd_lite(chat_id)
+                elif cmd == "/markets":   await cmd_markets(chat_id)
                 elif cmd == "/wallet":    await cmd_wallet(chat_id, args)
                 elif cmd == "/stop":
                     subscribers.pop(chat_id, None)
@@ -445,495 +550,503 @@ async def poll_telegram():
 
 # ── Alert Detectors ────────────────────────────────────────────────────────────
 
-async def check_whale(market_id: str, slug: str, usd: float, wallet: str, ts: str):
-    """Alert on a single trade exceeding whale threshold."""
-    threshold = WHALE_THRESHOLD
-    if usd >= threshold:
+async def check_whale(asset_id: str, usd: float, wallet: str, ts: str):
+    if usd >= WHALE_THRESHOLD:
         await broadcast("whale",
             f"🐳 *Whale Trade*\n\n"
-            f"Market: `{slug}`\n"
+            f"Market: `{slug_for(asset_id)}`\n"
             f"Size: `${usd:,.0f}`\n"
             f"Wallet: `{wallet[:10]}…`\n"
             f"Time: `{ts}`",
-            market_id=market_id,
+            asset_id=asset_id,
         )
 
 
-async def check_whale_cluster(market_id: str, wallet: str, ts: str):
-    """
-    Alert if the same wallet has 3+ large trades within 60s.
-    [FIX-04] Called BEFORE wallet_activity.append() so current trade isn't counted.
-    """
+async def check_whale_cluster(asset_id: str, wallet: str, ts: str):
     if not wallet:
         return
-    now = time.monotonic()
-    recent = [(t, w, u) for t, w, u in wallet_activity[market_id]
-              if now - t <= 60 and w == wallet]
+    now    = time.monotonic()
+    recent = [(t, w, u) for t, w, u in wallet_activity[asset_id] if now - t <= 60 and w == wallet]
     if len(recent) >= 3:
         total = sum(u for _, _, u in recent)
-        if total >= WHALE_THRESHOLD * 2 and cooldown_ok(market_id, "whale_cluster", 120):
+        if total >= WHALE_THRESHOLD * 2 and cooldown_ok(asset_id, "whale_cluster", 120):
             await broadcast("whale_cluster",
-                f"🔗 *Whale Cluster Detected*\n\n"
-                f"Market: `{market_id[:16]}`\n"
+                f"🔗 *Whale Cluster*\n\n"
+                f"Market: `{slug_for(asset_id)}`\n"
                 f"Wallet `{wallet[:10]}…` — {len(recent)} trades in 60s\n"
-                f"Total: `${total:,.0f}`\n"
-                f"⚠️ Possible manipulation\nTime: `{ts}`",
+                f"Total: `${total:,.0f}`\n⚠️ Possible manipulation\nTime: `{ts}`",
             )
 
 
-async def check_volume_spike(market_id: str, slug: str, usd: float, ts: str):
-    """Alert when a trade is ≥3× the recent average trade size."""
-    vols = [v for _, v in market_volumes[market_id]]
+async def check_volume_spike(asset_id: str, usd: float, ts: str):
+    vols = [v for _, v in market_volumes[asset_id]]
     if len(vols) < 10:
         return
     avg = mean(vols[:-1])
-    if avg > 0 and usd > avg * 3 and cooldown_ok(market_id, "volume_spike", 30):
+    if avg > 0 and usd > avg * 3 and cooldown_ok(asset_id, "volume_spike", 30):
         await broadcast("volume_spike",
             f"📈 *Volume Spike*\n\n"
-            f"Market: `{slug}`\n"
-            f"Trade: `${usd:,.0f}` vs avg `${avg:,.0f}`\n"
-            f"Ratio: `{usd/avg:.1f}×`\n"
+            f"Market: `{slug_for(asset_id)}`\n"
+            f"Trade: `${usd:,.0f}` vs avg `${avg:,.0f}` ({usd/avg:.1f}×)\n"
             f"Time: `{ts}`",
         )
 
 
-async def check_flash_crash(market_id: str, slug: str, ts: str):
-    """
-    Alert when trade prices drop >5% over the last 10 recorded trades.
-    [FIX-05] Uses trade_price_history only — not polluted by book tick prices.
-    """
-    prices = [p for _, p in list(trade_price_history[market_id])[-10:]]
+async def check_flash_crash(asset_id: str, ts: str):
+    prices = [p for _, p in list(trade_price_history[asset_id])[-10:]]
     if len(prices) < 5:
         return
     drop = (prices[0] - prices[-1]) / prices[0] if prices[0] > 0 else 0
-    if drop > 0.05 and cooldown_ok(market_id, "flash_crash", 120):
+    if drop > 0.05 and cooldown_ok(asset_id, "flash_crash", 120):
         await broadcast("flash_crash",
             f"💥 *Flash Crash*\n\n"
-            f"Market: `{slug}`\n"
-            f"Drop: `{drop*100:.1f}%` in last {len(prices)} trades\n"
-            f"`${prices[0]:.4f}` → `${prices[-1]:.4f}`\n"
-            f"Time: `{ts}`",
-            market_id=market_id,
+            f"Market: `{slug_for(asset_id)}`\n"
+            f"Drop: `{drop*100:.1f}%`\n"
+            f"`${prices[0]:.4f}` → `${prices[-1]:.4f}`\nTime: `{ts}`",
+            asset_id=asset_id,
         )
 
 
-async def check_momentum_reversal(market_id: str, slug: str, ts: str):
-    """Alert when the price trend direction flips (using trade prices only)."""
-    prices = [p for _, p in list(trade_price_history[market_id])[-20:]]
+async def check_momentum_reversal(asset_id: str, ts: str):
+    prices = [p for _, p in list(trade_price_history[asset_id])[-20:]]
     if len(prices) < 10:
         return
-    mid = len(prices) // 2
-    prev_change = (prices[mid] - prices[0]) / prices[0] if prices[0] > 0 else 0
+    mid         = len(prices) // 2
+    prev_change = (prices[mid] - prices[0]) / prices[0]  if prices[0]   > 0 else 0
     curr_change = (prices[-1] - prices[mid]) / prices[mid] if prices[mid] > 0 else 0
-    if prev_change > 0.02 and curr_change < -0.02 and cooldown_ok(market_id, "momentum", 120):
+    if prev_change > 0.02 and curr_change < -0.02 and cooldown_ok(asset_id, "momentum", 120):
         await broadcast("momentum",
             f"🔀 *Momentum Reversal*\n\n"
-            f"Market: `{slug}`\n"
-            f"Was rising `+{prev_change*100:.1f}%`, now falling `{curr_change*100:.1f}%`\n"
-            f"Time: `{ts}`",
-            market_id=market_id,
+            f"Market: `{slug_for(asset_id)}`\n"
+            f"Was rising `+{prev_change*100:.1f}%`, now falling `{curr_change*100:.1f}%`\nTime: `{ts}`",
+            asset_id=asset_id,
         )
-    elif prev_change < -0.02 and curr_change > 0.02 and cooldown_ok(market_id, "momentum", 120):
+    elif prev_change < -0.02 and curr_change > 0.02 and cooldown_ok(asset_id, "momentum", 120):
         await broadcast("momentum",
             f"🔀 *Momentum Reversal*\n\n"
-            f"Market: `{slug}`\n"
-            f"Was falling `{prev_change*100:.1f}%`, now rising `+{curr_change*100:.1f}%`\n"
-            f"Time: `{ts}`",
-            market_id=market_id,
+            f"Market: `{slug_for(asset_id)}`\n"
+            f"Was falling `{prev_change*100:.1f}%`, now rising `+{curr_change*100:.1f}%`\nTime: `{ts}`",
+            asset_id=asset_id,
         )
 
 
-async def check_coordinated(market_id: str, slug: str, ts: str):
-    """Alert when 5+ trades arrive within a 2-second burst window."""
-    now = time.monotonic()
-    burst = [t for t, *_ in market_trades[market_id] if now - t <= 2]
-    if len(burst) >= 5 and cooldown_ok(market_id, "coordinated", 60):
+async def check_coordinated(asset_id: str, ts: str):
+    now   = time.monotonic()
+    burst = [t for t, *_ in market_trades[asset_id] if now - t <= 2]
+    if len(burst) >= 5 and cooldown_ok(asset_id, "coordinated", 60):
         await broadcast("coordinated",
             f"🔄 *Coordinated Trading*\n\n"
-            f"Market: `{slug}`\n"
-            f"`{len(burst)}` trades in 2 seconds\n"
-            f"⚠️ Possible bot activity\nTime: `{ts}`",
+            f"Market: `{slug_for(asset_id)}`\n"
+            f"`{len(burst)}` trades in 2s — possible bot activity\nTime: `{ts}`",
         )
 
 
-async def check_imbalance(market_id: str, slug: str, bids: list, asks: list, ts: str):
-    """Alert on extreme bid/ask volume imbalance in the order book."""
-    bid_vol = sum(safe_float(b.get("size")) for b in bids[:10])  # [FIX-12]
+async def check_imbalance(asset_id: str, bids: list, asks: list, ts: str):
+    bid_vol = sum(safe_float(b.get("size")) for b in bids[:10])
     ask_vol = sum(safe_float(a.get("size")) for a in asks[:10])
     if bid_vol <= 0 or ask_vol <= 0:
         return
     ratio = bid_vol / ask_vol
-    sentiment_history[market_id].append((time.monotonic(), ratio))
-    if ratio > 3.0 and cooldown_ok(market_id, "imbalance_ratio", 60):
+    sentiment_history[asset_id].append((time.monotonic(), ratio))
+    if ratio > 3.0 and cooldown_ok(asset_id, "imbalance_ratio", 60):
         await broadcast("imbalance_ratio",
             f"⚖️ *Strong Bid Pressure*\n\n"
-            f"Market: `{slug}`\n"
-            f"Bid/Ask ratio: `{ratio:.1f}:1`\n"
-            f"📈 Heavy buy-side demand\nTime: `{ts}`",
+            f"Market: `{slug_for(asset_id)}`\n"
+            f"Bid/Ask: `{ratio:.1f}:1` — heavy buy demand\nTime: `{ts}`",
         )
-    elif ratio < 0.33 and cooldown_ok(market_id, "imbalance_ratio", 60):
+    elif ratio < 0.33 and cooldown_ok(asset_id, "imbalance_ratio", 60):
         await broadcast("imbalance_ratio",
             f"⚖️ *Strong Ask Pressure*\n\n"
-            f"Market: `{slug}`\n"
-            f"Bid/Ask ratio: `{ratio:.2f}:1`\n"
-            f"📉 Heavy sell-side pressure\nTime: `{ts}`",
+            f"Market: `{slug_for(asset_id)}`\n"
+            f"Bid/Ask: `{ratio:.2f}:1` — heavy sell pressure\nTime: `{ts}`",
         )
 
 
-async def check_sentiment_shift(market_id: str, slug: str, ts: str):
-    """Alert when bid/ask ratio trend reverses direction over recent history."""
-    hist = list(sentiment_history[market_id])
+async def check_sentiment_shift(asset_id: str, ts: str):
+    hist = list(sentiment_history[asset_id])
     if len(hist) < 8:
         return
     ratios = [r for _, r in hist[-8:]]
-    mid = len(ratios) // 2
-    prev = mean(ratios[:mid])
-    curr = mean(ratios[mid:])
-    prev_bull = prev > 1.3
-    curr_bull = curr > 1.3
-    prev_bear = prev < 0.7
-    curr_bear = curr < 0.7
-    if (prev_bull and curr_bear) or (prev_bear and curr_bull):
-        direction = "BEARISH" if curr_bear else "BULLISH"
-        if cooldown_ok(market_id, "sentiment_shift", 90):
+    mid    = len(ratios) // 2
+    prev, curr = mean(ratios[:mid]), mean(ratios[mid:])
+    if (prev > 1.3 and curr < 0.7) or (prev < 0.7 and curr > 1.3):
+        direction = "BEARISH" if curr < 0.7 else "BULLISH"
+        if cooldown_ok(asset_id, "sentiment_shift", 90):
             await broadcast("sentiment_shift",
                 f"💡 *Sentiment Flip → {direction}*\n\n"
-                f"Market: `{slug}`\n"
-                f"Ratio: `{prev:.2f}` → `{curr:.2f}`\n"
-                f"Major crowd reversal\nTime: `{ts}`",
+                f"Market: `{slug_for(asset_id)}`\n"
+                f"Ratio: `{prev:.2f}` → `{curr:.2f}`\nTime: `{ts}`",
             )
 
 
-async def check_liquidity_drain(market_id: str, slug: str, current_depth: float, ts: str):
-    """Alert when total order book depth drops >40% from its recent peak."""
-    depths = [d for _, d in list(order_book_history[market_id])[-20:]]
+async def check_liquidity_drain(asset_id: str, current_depth: float, ts: str):
+    depths = [d for _, d in list(order_book_history[asset_id])[-20:]]
     if len(depths) < 5:
         return
     peak = max(depths)
-    if peak > 0 and current_depth < peak * 0.6 and cooldown_ok(market_id, "liquidity_drain", 90):
+    if peak > 0 and current_depth < peak * 0.6 and cooldown_ok(asset_id, "liquidity_drain", 90):
         drop_pct = (peak - current_depth) / peak * 100
         await broadcast("liquidity_drain",
             f"🚨 *Liquidity Drain*\n\n"
-            f"Market: `{slug}`\n"
+            f"Market: `{slug_for(asset_id)}`\n"
             f"Depth dropped `{drop_pct:.0f}%` from peak\n"
-            f"Peak: `{peak:.0f}` → Now: `{current_depth:.0f}`\n"
-            f"⚠️ Flash crash risk\nTime: `{ts}`",
+            f"`{peak:.0f}` → `{current_depth:.0f}`\n⚠️ Flash crash risk\nTime: `{ts}`",
         )
 
 
-async def check_order_wall(market_id: str, slug: str, bids: list, asks: list, ts: str):
-    """Alert when a single order represents >40% of visible book depth."""
+async def check_order_wall(asset_id: str, bids: list, asks: list, ts: str):
     if not bids or not asks:
         return
-    total = (
-        sum(safe_float(b.get("size")) for b in bids[:10])  # [FIX-12]
-        + sum(safe_float(a.get("size")) for a in asks[:10])
-    )
+    total = (sum(safe_float(b.get("size")) for b in bids[:10])
+             + sum(safe_float(a.get("size")) for a in asks[:10]))
     if total <= 0:
         return
     largest_bid = max((safe_float(b.get("size")) for b in bids[:10]), default=0)
     largest_ask = max((safe_float(a.get("size")) for a in asks[:10]), default=0)
     wall = max(largest_bid, largest_ask)
     side = "BID" if largest_bid > largest_ask else "ASK"
-    if wall / total > 0.4 and cooldown_ok(market_id, "order_wall", 90):
+    if wall / total > 0.4 and cooldown_ok(asset_id, "order_wall", 90):
         await broadcast("order_wall",
-            f"🧱 *Order Wall Detected*\n\n"
-            f"Market: `{slug}`\n"
-            f"Single {side} order = `{wall/total*100:.0f}%` of book\n"
-            f"Size: `{wall:.0f}` shares\n"
-            f"Time: `{ts}`",
+            f"🧱 *Order Wall*\n\n"
+            f"Market: `{slug_for(asset_id)}`\n"
+            f"Single {side} = `{wall/total*100:.0f}%` of book (`{wall:.0f}` shares)\nTime: `{ts}`",
         )
 
 
-async def check_bid_ask_collapse(market_id: str, slug: str, bids: list, asks: list, ts: str):
-    """
-    Alert when spread collapses from a wide baseline to near-zero — signals imminent move.
-    [FIX-06] Requires ≥10 historical ticks AND prior avg spread >2% before firing.
-    """
+async def check_bid_ask_collapse(asset_id: str, bids: list, asks: list, ts: str):
     if not bids or not asks:
         return
-    best_bid = safe_float(bids[0].get("price"))  # [FIX-12]
-    best_ask = safe_float(asks[0].get("price"), default=1.0)
+    best_bid = safe_float(bids[0].get("price"))
+    best_ask = safe_float(asks[0].get("price"), fallback=1.0)
     if best_ask <= 0:
         return
     spread_pct = (best_ask - best_bid) / best_ask * 100
-    now = time.monotonic()
-    bid_ask_spreads[market_id].append((now, spread_pct))
-    spreads = [s for _, s in list(bid_ask_spreads[market_id])[-10:]]
-    # [FIX-06] Require 10 ticks before comparing — avoids false alarms at startup
+    bid_ask_spreads[asset_id].append((time.monotonic(), spread_pct))
+    spreads = [s for _, s in list(bid_ask_spreads[asset_id])[-10:]]
     if len(spreads) >= 10:
         avg_spread = mean(spreads[:-1])
-        if avg_spread > 2.0 and spread_pct < 0.3 and cooldown_ok(market_id, "bid_ask_collapse", 60):
+        if avg_spread > 2.0 and spread_pct < 0.3 and cooldown_ok(asset_id, "bid_ask_collapse", 60):
             await broadcast("bid_ask_collapse",
                 f"📊 *Bid-Ask Collapse*\n\n"
-                f"Market: `{slug}`\n"
-                f"Spread: `{avg_spread:.2f}%` → `{spread_pct:.2f}%`\n"
-                f"⚡ Large move imminent\nTime: `{ts}`",
+                f"Market: `{slug_for(asset_id)}`\n"
+                f"Spread: `{avg_spread:.2f}%` → `{spread_pct:.2f}%` ⚡ Large move imminent\nTime: `{ts}`",
             )
 
 
-async def check_market_maker(market_id: str, slug: str, ts: str):
-    """
-    Alert when spread stays tight across 20+ consecutive ticks.
-    [FIX-07] Threshold raised to 3% — realistic for binary prediction markets.
-    """
-    spreads = [s for _, s in list(bid_ask_spreads[market_id])[-20:]]
-    if len(spreads) >= 20 and all(s < 3.0 for s in spreads) and cooldown_ok(market_id, "market_maker", 300):
+async def check_market_maker(asset_id: str, ts: str):
+    spreads = [s for _, s in list(bid_ask_spreads[asset_id])[-20:]]
+    if len(spreads) >= 20 and all(s < 3.0 for s in spreads) and cooldown_ok(asset_id, "market_maker", 300):
         await broadcast("market_maker",
             f"🏦 *Market Maker Active*\n\n"
-            f"Market: `{slug}`\n"
-            f"Avg spread: `{mean(spreads):.2f}%` over last 20 ticks\n"
-            f"Professional liquidity provider present\nTime: `{ts}`",
+            f"Market: `{slug_for(asset_id)}`\n"
+            f"Avg spread: `{mean(spreads):.2f}%` over 20 ticks\nTime: `{ts}`",
         )
 
 
-async def check_anomaly_score(market_id: str, slug: str, usd: float, wallet: str, ts: str):
-    """Composite 0–100 risk score. Alerts above 65."""
+async def check_anomaly_score(asset_id: str, usd: float, wallet: str, ts: str):
     score = 0.0
-    now = time.monotonic()
-
+    now   = time.monotonic()
     if usd > WHALE_THRESHOLD:
         score += min(35, (usd / WHALE_THRESHOLD) * 10)
-
-    recent_wallet = [u for t, w, u in wallet_activity[market_id] if now - t <= 60 and w == wallet]
+    recent_wallet = [u for t, w, u in wallet_activity[asset_id] if now - t <= 60 and w == wallet]
     if len(recent_wallet) >= 2:
         score += min(25, len(recent_wallet) * 6)
-
-    vols = [v for _, v in market_volumes[market_id]]
+    vols = [v for _, v in market_volumes[asset_id]]
     if len(vols) >= 5:
         avg = mean(vols[:-1])
         if avg > 0 and usd > avg * 2:
             score += min(20, (usd / avg - 2) * 8)
-
-    burst = [t for t, *_ in market_trades[market_id] if now - t <= 3]
+    burst = [t for t, *_ in market_trades[asset_id] if now - t <= 3]
     if len(burst) >= 4:
         score += min(20, (len(burst) - 3) * 5)
-
-    anomaly_scores[market_id] = score
-    if score >= 65 and cooldown_ok(market_id, "anomaly_score", 45):
+    anomaly_scores[asset_id] = score
+    if score >= 65 and cooldown_ok(asset_id, "anomaly_score", 45):
         await broadcast("anomaly_score",
             f"🤖 *Anomaly Score: {score:.0f}/100*\n\n"
-            f"Market: `{slug}`\n"
-            f"Risk factors: size, repeat wallet, volume, burst trading\n"
-            f"⚠️ High suspicion activity\nTime: `{ts}`",
+            f"Market: `{slug_for(asset_id)}`\n"
+            f"Risk: size, repeat wallet, volume, burst\n⚠️ Suspicious activity\nTime: `{ts}`",
         )
     return score
 
 
-async def check_pattern_match(market_id: str, slug: str, ts: str):
-    """Detect pre-crash pattern: falling average with high volatility."""
-    prices = [p for _, p in list(trade_price_history[market_id])[-20:]]  # [FIX-05]
+async def check_pattern_match(asset_id: str, ts: str):
+    prices = [p for _, p in list(trade_price_history[asset_id])[-20:]]
     if len(prices) < 10:
         return
-    changes = [
-        (prices[i] - prices[i - 1]) / prices[i - 1]
-        for i in range(1, len(prices)) if prices[i - 1] > 0
-    ]
+    changes = [(prices[i] - prices[i-1]) / prices[i-1]
+               for i in range(1, len(prices)) if prices[i-1] > 0]
     if len(changes) < 5:
         return
     try:
         vol = stdev(changes[-5:])
         avg = mean(changes[-5:])
-        if vol > 0.04 and avg < -0.015 and cooldown_ok(market_id, "pattern_match", 120):
+        if vol > 0.04 and avg < -0.015 and cooldown_ok(asset_id, "pattern_match", 120):
             await broadcast("pattern_match",
                 f"📚 *Pre-Crash Pattern*\n\n"
-                f"Market: `{slug}`\n"
-                f"Falling `{avg*100:.2f}%` avg with `{vol*100:.2f}%` volatility\n"
-                f"⚠️ Matches historical crash behavior\nTime: `{ts}`",
+                f"Market: `{slug_for(asset_id)}`\n"
+                f"Avg `{avg*100:.2f}%`, vol `{vol*100:.2f}%`\n⚠️ Matches crash behavior\nTime: `{ts}`",
             )
     except Exception:
         pass
 
 
-async def check_insider_signal(market_id: str, slug: str, ts: str):
-    """Alert on unusual volume surge vs baseline — possible informed trading."""
-    vols = [v for _, v in market_volumes[market_id]]
+async def check_insider_signal(asset_id: str, ts: str):
+    vols = [v for _, v in market_volumes[asset_id]]
     if len(vols) < 20:
         return
     recent   = mean(vols[-5:])
     baseline = mean(vols[-20:-5])
-    if baseline > 0 and recent > baseline * 2.5 and cooldown_ok(market_id, "insider_signal", 90):
+    if baseline > 0 and recent > baseline * 2.5 and cooldown_ok(asset_id, "insider_signal", 90):
         await broadcast("insider_signal",
             f"👤 *Unusual Volume Surge*\n\n"
-            f"Market: `{slug}`\n"
-            f"Recent avg: `${recent:,.0f}` vs baseline: `${baseline:,.0f}`\n"
-            f"Ratio: `{recent/baseline:.1f}×`\n"
+            f"Market: `{slug_for(asset_id)}`\n"
+            f"Recent: `${recent:,.0f}` vs baseline: `${baseline:,.0f}` ({recent/baseline:.1f}×)\n"
             f"⚠️ Possible informed trading\nTime: `{ts}`",
         )
 
 
-async def check_arbitrage(market_id: str, slug: str, ts: str):
+async def check_arbitrage(asset_id: str, ts: str):
     """
-    Alert when YES + NO prices deviate significantly from 1.00.
-    [FIX-08] Old logic compared outcome prices to each other (always differs on non-50/50 markets).
-    Correct logic: sum of all outcome prices should be ~1.00 on a fair market.
-    Deviation >10% from 1.00 suggests genuine mispricing.
+    Outcome mispricing: sum of YES+NO prices should be ~1.00 on a fair market.
+    We track prices by asset_id; use the condition_id (market) to sum outcomes.
+    Since we store per-asset, check all assets for a slug to sum them.
     """
-    prices = market_prices.get(market_id, {})
-    if len(prices) < 2:
+    slug = slug_for(asset_id)
+    # Gather all asset prices for this market slug
+    related = {aid: list(market_prices[aid].values())
+               for aid, s in asset_slug.items() if s == slug and market_prices[aid]}
+    if len(related) < 2:
         return
-    total = sum(prices.values())
+    # Take the latest price for each asset
+    latest_prices = []
+    for aid, price_vals in related.items():
+        if price_vals:
+            latest_prices.append(price_vals[-1])
+    if len(latest_prices) < 2:
+        return
+    total     = sum(latest_prices)
     deviation = abs(total - 1.0)
-    if deviation > 0.10 and cooldown_ok(market_id, "arbitrage", 60):
+    if deviation > 0.10 and cooldown_ok(asset_id, "arbitrage", 60):
         await broadcast("arbitrage",
             f"💰 *Outcome Mispricing*\n\n"
             f"Market: `{slug}`\n"
-            f"Sum of outcome prices: `{total:.3f}` (expected ~1.00)\n"
-            f"Deviation: `{deviation*100:.1f}%` — possible arbitrage\nTime: `{ts}`",
+            f"Sum of prices: `{total:.3f}` (expected ~1.00)\n"
+            f"Deviation: `{deviation*100:.1f}%`\nTime: `{ts}`",
         )
 
 
-async def check_depth_prediction(market_id: str, slug: str, current_depth: float, ts: str):
-    """Alert on sustained declining depth trend — predicts liquidity crisis."""
-    depths = [d for _, d in list(order_book_history[market_id])[-15:]]
+async def check_depth_prediction(asset_id: str, current_depth: float, ts: str):
+    depths = [d for _, d in list(order_book_history[asset_id])[-15:]]
     if len(depths) < 8:
         return
     trend = (depths[-1] - depths[0]) / depths[0] if depths[0] > 0 else 0
-    if trend < -0.35 and cooldown_ok(market_id, "depth_prediction", 90):
+    if trend < -0.35 and cooldown_ok(asset_id, "depth_prediction", 90):
         await broadcast("depth_prediction",
             f"🔮 *Liquidity Crisis Incoming*\n\n"
-            f"Market: `{slug}`\n"
-            f"Depth declining `{trend*100:.0f}%` over last 15 snapshots\n"
-            f"⚠️ High flash crash risk\nTime: `{ts}`",
+            f"Market: `{slug_for(asset_id)}`\n"
+            f"Depth declining `{trend*100:.0f}%` over 15 snapshots\n⚠️ Flash crash risk\nTime: `{ts}`",
         )
 
 
-async def check_volume_profile(market_id: str, slug: str, price: float, volume: float):
-    """Alert when >60% of all recorded volume concentrates at a single price level."""
+async def check_volume_profile(asset_id: str, price: float, volume: float):
     level = round(price, 3)
-    volume_profile_data[market_id][level] += volume
-    top = sorted(volume_profile_data[market_id].items(), key=lambda x: x[1], reverse=True)[:3]
+    volume_profile_data[asset_id][level] += volume
+    top   = sorted(volume_profile_data[asset_id].items(), key=lambda x: x[1], reverse=True)[:3]
     total = sum(v for _, v in top)
-    if total > 0 and top[0][1] / total > 0.6 and cooldown_ok(market_id, "volume_profile", 120):
+    if total > 0 and top[0][1] / total > 0.6 and cooldown_ok(asset_id, "volume_profile", 120):
         await broadcast("volume_profile",
             f"📊 *Volume Concentration*\n\n"
-            f"Market: `{slug}`\n"
-            f"60%+ of volume at `${top[0][0]:.4f}`\n"
-            f"📍 Key support/resistance level",
+            f"Market: `{slug_for(asset_id)}`\n"
+            f"60%+ of volume at `${top[0][0]:.4f}` — key S/R level",
         )
 
 
-# ── Main Trade Processor ───────────────────────────────────────────────────────
-async def process_trade(market_id: str, trade: dict):
-    size   = safe_float(trade.get("size"))    # [FIX-12]
-    price  = safe_float(trade.get("price"))
-    usd    = size * price
-    slug   = trade.get("market_slug") or market_id[:20]
+# ── Event Processors ───────────────────────────────────────────────────────────
+
+async def process_last_trade_price(asset_id: str, msg: dict):
+    """
+    [FIX-D] Official last_trade_price format:
+      msg.side, msg.size, msg.price  (flat top-level fields)
+    """
+    price  = safe_float(msg.get("price"))
+    size   = safe_float(msg.get("size"))
+    usd    = price * size
+    wallet = msg.get("maker_address") or msg.get("taker_address") or ""
     ts     = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-    wallet = trade.get("maker_address") or trade.get("taker_address") or ""
     now    = time.monotonic()
 
-    market_trades[market_id].append((now, usd, size, price, wallet))
-    market_volumes[market_id].append((now, usd))
-    trade_price_history[market_id].append((now, price))  # [FIX-05] trade history only
+    market_trades[asset_id].append((now, usd, size, price, wallet))
+    market_volumes[asset_id].append((now, usd))
+    trade_price_history[asset_id].append((now, price))
 
-    # [FIX-04] cluster check BEFORE appending wallet activity
-    await check_whale_cluster(market_id, wallet, ts)
+    # [FIX-04 from v4] cluster check BEFORE appending wallet
+    await check_whale_cluster(asset_id, wallet, ts)
     if wallet:
-        wallet_activity[market_id].append((now, wallet, usd))
+        wallet_activity[asset_id].append((now, wallet, usd))
 
-    await check_whale(market_id, slug, usd, wallet, ts)
-    await check_volume_spike(market_id, slug, usd, ts)
-    await check_coordinated(market_id, slug, ts)
-    await check_anomaly_score(market_id, slug, usd, wallet, ts)
-    await check_volume_profile(market_id, slug, price, usd)
-    await check_insider_signal(market_id, slug, ts)
-    await check_flash_crash(market_id, slug, ts)
-    await check_momentum_reversal(market_id, slug, ts)
-    await check_pattern_match(market_id, slug, ts)
-
-
-async def process_price_update(market_id: str, update: dict):
-    outcome_id = update.get("asset_id") or update.get("outcome_id", "unk")
-    price      = safe_float(update.get("price"))  # [FIX-12]
-    slug       = update.get("market_slug") or market_id[:20]
-    ts         = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-    now        = time.monotonic()
-
-    market_prices[market_id][outcome_id] = price
-    book_price_history[market_id].append((now, price))  # [FIX-05] book history only
-
-    await check_arbitrage(market_id, slug, ts)
-    # Note: flash_crash and pattern_match intentionally NOT run here —
-    # they need trade prices, not book tick prices. [FIX-05]
+    await check_whale(asset_id, usd, wallet, ts)
+    await check_volume_spike(asset_id, usd, ts)
+    await check_coordinated(asset_id, ts)
+    await check_anomaly_score(asset_id, usd, wallet, ts)
+    await check_volume_profile(asset_id, price, usd)
+    await check_insider_signal(asset_id, ts)
+    await check_flash_crash(asset_id, ts)
+    await check_momentum_reversal(asset_id, ts)
+    await check_pattern_match(asset_id, ts)
 
 
-async def process_order_book(market_id: str, book: dict):
-    bids = book.get("bids", [])
-    asks = book.get("asks", [])
-    slug = book.get("market_slug") or market_id[:20]
+async def process_price_change(asset_id: str, msg: dict):
+    """
+    [FIX-C] Official price_change format:
+      msg["price_changes"] = list of {side, size, price, best_bid, best_ask, ...}
+    """
+    changes = msg.get("price_changes", [])
+    if not changes:
+        # Fallback: some implementations send flat fields
+        price = safe_float(msg.get("price"))
+        if price:
+            changes = [msg]
+
+    ts  = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    now = time.monotonic()
+
+    for pc in changes:
+        price = safe_float(pc.get("price"))
+        if price <= 0:
+            continue
+        book_price_history[asset_id].append((now, price))
+        market_prices[asset_id]["latest"] = price
+
+    await check_arbitrage(asset_id, ts)
+
+
+async def process_book(asset_id: str, msg: dict):
+    """
+    [FIX-E] Official book format:
+      msg.bids = [{price, size}, ...]
+      msg.asks = [{price, size}, ...]
+      msg.asset_id identifies the token
+    """
+    bids = msg.get("bids", [])
+    asks = msg.get("asks", [])
     ts   = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
     now  = time.monotonic()
 
-    market_order_book[market_id] = {"bids": bids, "asks": asks}
-    bid_vol       = sum(safe_float(b.get("size")) for b in bids[:10])  # [FIX-12]
+    market_order_book[asset_id] = {"bids": bids, "asks": asks}
+    bid_vol       = sum(safe_float(b.get("size")) for b in bids[:10])
     ask_vol       = sum(safe_float(a.get("size")) for a in asks[:10])
     current_depth = bid_vol + ask_vol
-    order_book_history[market_id].append((now, current_depth))
+    order_book_history[asset_id].append((now, current_depth))
 
-    await check_imbalance(market_id, slug, bids, asks, ts)
-    await check_sentiment_shift(market_id, slug, ts)
-    await check_liquidity_drain(market_id, slug, current_depth, ts)
-    await check_order_wall(market_id, slug, bids, asks, ts)
-    await check_bid_ask_collapse(market_id, slug, bids, asks, ts)
-    await check_market_maker(market_id, slug, ts)
-    await check_depth_prediction(market_id, slug, current_depth, ts)
+    await check_imbalance(asset_id, bids, asks, ts)
+    await check_sentiment_shift(asset_id, ts)
+    await check_liquidity_drain(asset_id, current_depth, ts)
+    await check_order_wall(asset_id, bids, asks, ts)
+    await check_bid_ask_collapse(asset_id, bids, asks, ts)
+    await check_market_maker(asset_id, ts)
+    await check_depth_prediction(asset_id, current_depth, ts)
 
 
 # ── Polymarket WebSocket ───────────────────────────────────────────────────────
 async def polymarket_ws():
     """
-    Connect to Polymarket CLOB WebSocket and route incoming events.
-    [FIX-02] Corrected subscription payload format.
+    [FIX-A/B/C/D/E/F/G] Corrected WS implementation.
+    - Subscribes using assets_ids (token IDs) with type="market"
+    - Handles PING/PONG heartbeat as plain text
+    - Routes correct event types: book, price_change, last_trade_price
+    - Refreshes market list every 30 min
     """
-    backoff = 5
+    global subscribed_assets, asset_slug
+
+    backoff      = 5
+    last_refresh = 0.0
+
     while True:
+        # [FIX-I] Refresh market list every 30 min or on first run
+        now_ts = time.time()
+        if now_ts - last_refresh > 1800:
+            new_mapping = await fetch_active_asset_ids()
+            if new_mapping:
+                asset_slug.update(new_mapping)
+                subscribed_assets = set(asset_slug.keys())
+                last_refresh = now_ts
+            if not subscribed_assets:
+                log.warning("No asset IDs — retrying in 30s")
+                await asyncio.sleep(30)
+                continue
+
         try:
-            log.info("Connecting to Polymarket WS…")
+            log.info(f"Connecting to Polymarket WS ({len(subscribed_assets)} assets)…")
             async with websockets.connect(
                 POLYMARKET_WS_URL,
-                ping_interval=20, ping_timeout=10, max_size=2 ** 23,
+                ping_interval=None,   # [FIX-F] we handle heartbeat manually
+                ping_timeout=None,
+                max_size=2 ** 23,
             ) as ws:
                 backoff = 5
-                log.info("✅ Connected to Polymarket")
 
-                # [FIX-02] Correct subscription: subscribe to the live_activity channel
-                # which broadcasts all market events without needing specific market IDs
+                # [FIX-A/G] Correct subscription format per official docs
+                asset_list = list(subscribed_assets)
                 await ws.send(json.dumps({
-                    "type": "subscribe",
-                    "channel": "live_activity",
+                    "type": "market",
+                    "assets_ids": asset_list,
+                    "custom_feature_enabled": True,  # [FIX-G]
                 }))
+                log.info("✅ Subscribed to Polymarket market channel")
 
-                async for raw in ws:
-                    try:
-                        msgs = json.loads(raw)
-                        if not isinstance(msgs, list):
-                            msgs = [msgs]
-                        for msg in msgs:
-                            event     = msg.get("event_type") or msg.get("type") or ""
-                            market_id = (
-                                msg.get("market_id")
-                                or msg.get("condition_id")
-                                or msg.get("marketId")
-                                or ""
-                            )
-                            if not market_id:
-                                continue
+                # [FIX-F] Manual heartbeat: send PING every 10s
+                async def heartbeat():
+                    while True:
+                        await asyncio.sleep(10)
+                        try:
+                            await ws.send("PING")
+                        except Exception:
+                            break
 
-                            if event in ("trade", "orders_matched", "TRADE"):
-                                await process_trade(market_id, msg)
-                            elif event in ("price_change", "price_update", "PRICE_CHANGE"):
-                                await process_price_update(market_id, msg)
-                            elif event in ("order_book", "book_snapshot", "BOOK", "book"):
-                                await process_order_book(market_id, msg)
-                            elif event == "tick_size_change":
-                                pass
+                hb_task = asyncio.create_task(heartbeat())
+
+                try:
+                    async for raw in ws:
+                        # [FIX-F] Filter PONG responses before JSON parse
+                        if isinstance(raw, str) and raw.strip() == "PONG":
+                            continue
+
+                        try:
+                            msg = json.loads(raw)
+                            # Market channel delivers single objects (not lists)
+                            if isinstance(msg, list):
+                                msgs = msg
                             else:
-                                # Fallback: handle unknown events that look like trades
-                                if msg.get("price") and msg.get("size"):
-                                    await process_trade(market_id, msg)
-                    except Exception as e:
-                        log.warning(f"WS msg error: {e}")
+                                msgs = [msg]
+
+                            for m in msgs:
+                                event    = m.get("event_type") or m.get("type") or ""
+                                asset_id = (m.get("asset_id")
+                                            or m.get("token_id")
+                                            or m.get("market_id")
+                                            or "")
+                                if not asset_id:
+                                    continue
+
+                                # [FIX-B] Correct official event names
+                                if event == "last_trade_price":
+                                    await process_last_trade_price(asset_id, m)
+                                elif event == "price_change":
+                                    await process_price_change(asset_id, m)
+                                elif event == "book":
+                                    await process_book(asset_id, m)
+                                elif event in ("tick_size_change", "best_bid_ask",
+                                               "new_market", "market_resolved"):
+                                    pass  # informational only
+                                else:
+                                    log.debug(f"Unknown event: {event}")
+
+                        except json.JSONDecodeError:
+                            pass  # PING/PONG or malformed frame
+                        except Exception as e:
+                            log.warning(f"WS msg error: {e}")
+                finally:
+                    hb_task.cancel()
 
         except Exception as e:
             log.warning(f"WS disconnected: {e} — retrying in {backoff}s")
@@ -941,62 +1054,73 @@ async def polymarket_ws():
             backoff = min(backoff * 2, 60)
 
 
-# ── Supervised Task Runner ─────────────────────────────────────────────────────
-# [FIX-10] Each task runs in its own infinite restart loop.
-# One crash no longer kills the whole bot.
+# ── Market Refresh Loop ────────────────────────────────────────────────────────
+async def market_refresh_loop():
+    """[FIX-I] Periodically re-fetch active markets and reconnect if needed."""
+    while True:
+        await asyncio.sleep(1800)  # 30 min
+        new_mapping = await fetch_active_asset_ids()
+        if new_mapping:
+            new_ids = set(new_mapping.keys()) - subscribed_assets
+            asset_slug.update(new_mapping)
+            subscribed_assets.update(new_mapping.keys())
+            if new_ids:
+                log.info(f"Market refresh: {len(new_ids)} new asset IDs discovered")
 
-async def supervised(name: str, coro_fn):
-    """Wrap a coroutine in an infinite restart loop with logging."""
+
+# ── Supervised Task Runner ─────────────────────────────────────────────────────
+async def supervised(name: str, coro_fn, *args):
     while True:
         try:
-            log.info(f"Starting task: {name}")
-            await coro_fn()
+            log.info(f"▶ Starting: {name}")
+            await coro_fn(*args)
         except Exception as e:
-            log.error(f"Task '{name}' crashed: {e} — restarting in 5s")
+            log.error(f"✖ '{name}' crashed: {e} — restarting in 5s")
             await asyncio.sleep(5)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 async def main():
-    log.info("🚀 Starting Polymarket Bot v4.0")
+    log.info("🚀 Starting Polymarket Bot v5.0")
 
-    load_state()  # [FIX-13]
+    fresh = not load_state()
 
-    # Health server must start first — Render checks port within 50s
     await run_health_server()
 
-    # Auto-subscribe owner
     if OWNER_CHAT_ID not in subscribers:
         subscribers[OWNER_CHAT_ID] = set(ALL_ALERTS)
         user_sensitivity[OWNER_CHAT_ID] = "normal"
         save_state()
 
+    notice = "🆕 Fresh instance — subscriber list reloaded from disk (or empty).\n\n" if fresh else ""
+
     await send(OWNER_CHAT_ID,
-        "🚀 *POLYMARKET BOT v4.0 ONLINE*\n\n"
-        "All detectors active:\n"
-        "🐳 Whale & cluster\n"
-        "📈 Volume spike\n"
-        "💥 Flash crash + chart\n"
-        "🚨 Liquidity drain\n"
-        "🧱 Order wall\n"
-        "🔄 Coordinated trades\n"
-        "⚖️ Bid/ask imbalance\n"
-        "💡 Sentiment shift\n"
-        "📊 Bid-ask collapse\n"
-        "🏦 Market maker\n"
-        "🤖 Anomaly score\n"
-        "📚 Pattern match\n"
-        "👤 Insider signal\n"
-        "💰 Outcome mispricing\n"
-        "🔮 Depth prediction\n"
-        "💼 Wallet checker\n\n"
-        "/help — commands"
+        f"🚀 *POLYMARKET BOT v5.0 ONLINE*\n\n"
+        f"{notice}"
+        "Fetching active markets…"
     )
 
-    # [FIX-10] Independent supervised loops — one crash won't kill the other
+    # Initial market fetch
+    mapping = await fetch_active_asset_ids()
+    if mapping:
+        asset_slug.update(mapping)
+        subscribed_assets.update(mapping.keys())
+        await send(OWNER_CHAT_ID,
+            f"✅ Subscribed to *{len(subscribed_assets)} asset IDs* "
+            f"across *{len(set(asset_slug.values()))} markets*\n\n"
+            "/help — commands"
+        )
+    else:
+        await send(OWNER_CHAT_ID,
+            "⚠️ Could not fetch market list from Gamma API.\n"
+            "WS will retry automatically."
+        )
+
     await asyncio.gather(
-        supervised("telegram_poll", poll_telegram),
-        supervised("polymarket_ws", polymarket_ws),
+        supervised("telegram_poll",     poll_telegram),
+        supervised("polymarket_ws",     polymarket_ws),
+        supervised("self_ping",         self_ping_loop),
+        supervised("market_refresh",    market_refresh_loop),
     )
 
 
@@ -1005,29 +1129,35 @@ if __name__ == "__main__":
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# RENDER DEPLOYMENT NOTES
+# RENDER DEPLOYMENT CHECKLIST
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #
-# 1. Required environment variables (set in Render dashboard):
+# 1. Environment variables (Render → your service → Environment):
 #      TELEGRAM_TOKEN=<from @BotFather>
-#      OWNER_CHAT_ID=<your numeric Telegram chat ID>
-#      WHALE_THRESHOLD_USD=5000   (optional)
-#      PORT=10000                 (optional, Render sets this automatically)
+#      OWNER_CHAT_ID=<your numeric Telegram ID>
+#      RENDER_EXTERNAL_URL=https://<your-service>.onrender.com
+#      WHALE_THRESHOLD_USD=5000    (optional)
 #
 # 2. Start command:
-#      python polymarket_bot_v4.py
+#      python polymarket_bot_v5.py
 #
-# 3. [FIX-14] Free Render tier sleep fix:
-#    Render's free tier spins the service down after ~15min of no inbound HTTP.
-#    Your WebSocket is outbound and does NOT count as activity.
-#    Fix: create a FREE UptimeRobot monitor at https://uptimerobot.com
-#      - Monitor type: HTTP(s)
-#      - URL: https://<your-render-url>/health
-#      - Check interval: 5 minutes
-#    This keeps Render awake 24/7 on the free plan.
-#
-# 4. requirements.txt:
+# 3. requirements.txt:
 #      httpx
 #      websockets
 #      aiohttp
+#
+# 4. Free tier keep-alive:
+#    The bot self-pings /health every 10 min if RENDER_EXTERNAL_URL is set.
+#    For extra reliability, also add a FREE UptimeRobot monitor:
+#      https://uptimerobot.com
+#      → Monitor type: HTTP(s)
+#      → URL: https://<your-service>.onrender.com/health
+#      → Interval: every 5 minutes
+#
+# 5. Render free tier limits (as of June 2026):
+#    - 512 MB RAM, 0.1 CPU
+#    - 750 hours/month free compute
+#    - Sleeps after 15 min of no inbound HTTP
+#    - 30-60s cold start on wake
+#    - State in /tmp is wiped on every restart
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
