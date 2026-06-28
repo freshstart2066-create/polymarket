@@ -33,7 +33,7 @@ REDIS_URL       = os.getenv("REDIS_URL", "")
 SELF_URL        = os.getenv("RENDER_EXTERNAL_URL", "")
 
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL    = "gemini-2.0-flash"   # free tier, fast, generous limits
+GEMINI_MODEL    = "gemini-1.5-flash"   # free tier: 1500 req/day, 1M tokens/min
 GEMINI_API      = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_MODEL}:generateContent"
@@ -167,13 +167,21 @@ async def load_state():
 # Telegram helpers
 # ---------------------------------------------------------------------------
 async def send(chat_id: str | int, text: str):
+    """Send message, fall back to plain text if Markdown causes a 400."""
     try:
         async with httpx.AsyncClient() as client:
-            await client.post(
+            r = await client.post(
                 f"{TELEGRAM_API}/sendMessage",
                 json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
                 timeout=10,
             )
+            if r.status_code == 400:
+                # Markdown parse failed — retry as plain text
+                await client.post(
+                    f"{TELEGRAM_API}/sendMessage",
+                    json={"chat_id": chat_id, "text": text},
+                    timeout=10,
+                )
     except Exception as e:
         log.warning(f"send() failed for {chat_id}: {e}")
 
