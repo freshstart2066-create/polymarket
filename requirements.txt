@@ -3,4 +3,3 @@ httpx==0.27.0
 aiohttp
 python-dotenv==1.0.1
 aioredis>=2.0.0
-anthropic>=0.25.0
