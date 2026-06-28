@@ -33,9 +33,9 @@ REDIS_URL       = os.getenv("REDIS_URL", "")
 SELF_URL        = os.getenv("RENDER_EXTERNAL_URL", "")
 
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL    = "gemini-1.5-flash"   # free tier: 1500 req/day, 1M tokens/min
+GEMINI_MODEL    = "gemini-1.5-flash-latest"
 GEMINI_API      = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"https://generativelanguage.googleapis.com/v1/models/"
     f"{GEMINI_MODEL}:generateContent"
 )
 AI_MAX_TOKENS   = 1024
