@@ -828,7 +828,7 @@ async def cmd_ask(chat_id: str | int, question: str):
             "Or just send a message without a command and I'll reply.")
         return
 
-    await send(chat_id, "🤖 _Thinking…_")
+    await send(chat_id, "🤖 Thinking...")
 
     cid_history = list(ai_conversations[cid])
     system_prompt = _build_market_context(cid)
